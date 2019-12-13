@@ -23,9 +23,11 @@ from tensorflow.python import tf2
 from tensorflow.python.data.ops import dataset_ops
 from tensorflow.python.distribute import combinations
 from tensorflow.python.distribute import strategy_combinations
+from tensorflow.python.eager import backprop
 from tensorflow.python.eager import def_function
 from tensorflow.python.eager import test
 from tensorflow.python.framework import constant_op
+from tensorflow.python.framework import dtypes
 from tensorflow.python.ops import math_ops
 from tensorflow.python.ops import variables
 
@@ -35,13 +37,12 @@ class InputIterationTest(test.TestCase, parameterized.TestCase):
   @combinations.generate(
       combinations.combine(
           distribution=strategy_combinations.strategies_minus_tpu,
-          mode=["eager"]
-      ))
+          mode=["eager"]))
   def testFullEager(self, distribution):
     dataset = self._get_dataset()
 
     def train_step(data):
-      return data
+      return math_ops.square(data)
 
     dist_dataset = distribution.experimental_distribute_dataset(dataset)
     results = []
@@ -53,7 +54,7 @@ class InputIterationTest(test.TestCase, parameterized.TestCase):
 
   @combinations.generate(
       combinations.combine(
-          distribution=strategy_combinations.strategies_minus_tpu,
+          distribution=strategy_combinations.all_strategies,
           mode=["eager"]
       ))
   def testStepInFunction(self, distribution):
@@ -61,7 +62,7 @@ class InputIterationTest(test.TestCase, parameterized.TestCase):
 
     @def_function.function
     def train_step(data):
-      return data
+      return math_ops.square(data)
 
     dist_dataset = distribution.experimental_distribute_dataset(dataset)
     results = []
@@ -73,15 +74,14 @@ class InputIterationTest(test.TestCase, parameterized.TestCase):
 
   @combinations.generate(
       combinations.combine(
-          distribution=strategy_combinations.strategies_minus_tpu +
-          [strategy_combinations.tpu_strategy_one_step],
+          distribution=strategy_combinations.all_strategies,
           mode=["eager"]
       ))
   def testRunInFunction(self, distribution):
     dataset = self._get_dataset()
 
     def train_step(data):
-      return data
+      return math_ops.square(data)
 
     @def_function.function
     def f_train_step(input_data):
@@ -97,7 +97,30 @@ class InputIterationTest(test.TestCase, parameterized.TestCase):
 
   @combinations.generate(
       combinations.combine(
-          distribution=strategy_combinations.strategies_minus_tpu,
+          distribution=strategy_combinations.all_strategies,
+          mode=["eager"]
+      ))
+  def testRunInFunctionAutoGraphApplication(self, distribution):
+    dataset = self._get_dataset()
+
+    def train_step(data):
+      return math_ops.square(data)
+
+    @def_function.function
+    def f_train_step(input_data):
+      return distribution.experimental_local_results(
+          distribution.experimental_run_v2(train_step, args=(input_data,)))
+
+    dist_dataset = distribution.experimental_distribute_dataset(dataset)
+    results = []
+    for x in dist_dataset:
+      output = f_train_step(x)
+      results.append(output)
+    self._validate_outputs(results)
+
+  @combinations.generate(
+      combinations.combine(
+          distribution=strategy_combinations.all_strategies,
           mode=["eager"]
       ))
   def testDatasetIterationInFunction(self, distribution):
@@ -139,14 +162,13 @@ class InputIterationTest(test.TestCase, parameterized.TestCase):
 
   @combinations.generate(
       combinations.combine(
-          distribution=strategy_combinations.strategies_minus_tpu +
-          [strategy_combinations.tpu_strategy_one_step],
+          distribution=strategy_combinations.all_strategies,
           mode=["eager"]
       ))
   def testIterationInsideFunction(self, distribution):
 
     def step_fn(data):
-      return data
+      return math_ops.square(data)
 
     @def_function.function
     def train(dataset):
@@ -168,14 +190,13 @@ class InputIterationTest(test.TestCase, parameterized.TestCase):
 
   @combinations.generate(
       combinations.combine(
-          distribution=strategy_combinations.strategies_minus_tpu +
-          [strategy_combinations.tpu_strategy_one_step],
+          distribution=strategy_combinations.all_strategies,
           mode=["eager"]
       ))
   def testIterationOutsideFunction(self, distribution):
 
     def train_step(data):
-      return data
+      return math_ops.square(data)
 
     @def_function.function
     def f_train_step(input_data):
@@ -195,12 +216,14 @@ class InputIterationTest(test.TestCase, parameterized.TestCase):
 
   def _get_dataset(self):
     if tf2.enabled():
-      return dataset_ops.DatasetV2.range(10).batch(2)
+      return dataset_ops.DatasetV2.range(10).\
+        map(lambda x: math_ops.cast(x, dtypes.int32)).batch(2)
     else:
-      return dataset_ops.Dataset.range(10).batch(2)
+      return dataset_ops.Dataset.range(10).\
+        map(lambda x: math_ops.cast(x, dtypes.int32)).batch(2)
 
   def _validate_outputs(self, actual_results):
-    expected_results = [[i, i+1] for i in range(0, 10, 2)]
+    expected_results = [[i**2, (i+1)**2] for i in range(0, 10, 2)]
     self.assertEqual(len(expected_results), len(actual_results))
 
     for i, expected_result in enumerate(expected_results):
@@ -210,6 +233,37 @@ class InputIterationTest(test.TestCase, parameterized.TestCase):
         final_result.extend(val.numpy())
       self.assertAllEqual(expected_result, final_result)
 
+
+class GradientTapeTest(test.TestCase, parameterized.TestCase):
+
+  @combinations.generate(
+      combinations.combine(
+          distribution=strategy_combinations.all_strategies,
+          mode=["eager"],
+          model_in_tf_function=[True, False]
+      ))
+  def testNestedFunction(self, distribution, model_in_tf_function):
+    def model(x):
+      return x * x
+
+    if model_in_tf_function:
+      model = def_function.function(model)
+
+    with distribution.scope():
+      x = variables.Variable(1.0)
+
+      @def_function.function
+      def train_step():
+        def replica_step():
+          with backprop.GradientTape() as tape:
+            y = model(x)
+          return tape.gradient(y, x)
+        return distribution.experimental_run_v2(replica_step)
+
+      grads = distribution.experimental_local_results(train_step())
+      self.assertLen(grads, distribution.num_replicas_in_sync)
+      self.assertTrue(all(g is not None for g in grads))
+
+
 if __name__ == "__main__":
   test.main()
-

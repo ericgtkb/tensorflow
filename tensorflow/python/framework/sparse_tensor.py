@@ -21,8 +21,11 @@ from __future__ import print_function
 import collections
 import numpy as np
 
-from tensorflow.python import pywrap_tensorflow
+from tensorflow.python import pywrap_tensorflow  # pylint: disable=unused-import
+from tensorflow.python import _pywrap_utils
+from tensorflow.python import tf2
 from tensorflow.python.framework import composite_tensor
+from tensorflow.python.framework import constant_op
 from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import ops
 from tensorflow.python.framework import tensor_like
@@ -54,20 +57,19 @@ class SparseTensor(_TensorLike, composite_tensor.CompositeTensor):
   comprises the following components, where `N` and `ndims` are the number
   of values and number of dimensions in the `SparseTensor`, respectively:
 
-  * `indices`: A 2-D int64 tensor of dense_shape `[N, ndims]`, which specifies
-    the indices of the elements in the sparse tensor that contain nonzero
-    values (elements are zero-indexed). For example, `indices=[[1,3], [2,4]]`
-    specifies that the elements with indexes of [1,3] and [2,4] have
-    nonzero values.
+  * `indices`: A 2-D int64 tensor of shape `[N, ndims]`, which specifies the
+    indices of the elements in the sparse tensor that contain nonzero values
+    (elements are zero-indexed). For example, `indices=[[1,3], [2,4]]` specifies
+    that the elements with indexes of [1,3] and [2,4] have nonzero values.
 
-  * `values`: A 1-D tensor of any type and dense_shape `[N]`, which supplies the
-    values for each element in `indices`. For example, given
-    `indices=[[1,3], [2,4]]`, the parameter `values=[18, 3.6]` specifies
-    that element [1,3] of the sparse tensor has a value of 18, and element
-    [2,4] of the tensor has a value of 3.6.
+  * `values`: A 1-D tensor of any type and shape `[N]`, which supplies the
+    values for each element in `indices`. For example, given `indices=[[1,3],
+    [2,4]]`, the parameter `values=[18, 3.6]` specifies that element [1,3] of
+    the sparse tensor has a value of 18, and element [2,4] of the tensor has a
+    value of 3.6.
 
-  * `dense_shape`: A 1-D int64 tensor of dense_shape `[ndims]`, which specifies
-    the dense_shape of the sparse tensor. Takes a list indicating the number of
+  * `dense_shape`: A 1-D int64 tensor of shape `[ndims]`, which specifies the
+    dense_shape of the sparse tensor. Takes a list indicating the number of
     elements in each dimension. For example, `dense_shape=[3,6]` specifies a
     two-dimensional 3x6 tensor, `dense_shape=[2,3,4]` specifies a
     three-dimensional 2x3x4 tensor, and `dense_shape=[9]` specifies a
@@ -119,23 +121,14 @@ class SparseTensor(_TensorLike, composite_tensor.CompositeTensor):
       values: A 1-D tensor of any type and shape `[N]`.
       dense_shape: A 1-D int64 tensor of shape `[ndims]`.
     """
-    if isinstance(indices, tensor_spec.TensorSpec):
-      # TODO(b/133606651) Remove this code path -- replaced by TypeSpec.
-      if not isinstance(values, tensor_spec.TensorSpec):
-        raise TypeError("Expected values to be a TensorSpec")
-      if not isinstance(dense_shape, tensor_spec.TensorSpec):
-        raise TypeError("Expected dense_shape to be a TensorSpec")
-      if indices.dtype != dtypes.int64 or dense_shape.dtype != dtypes.int64:
-        raise TypeError("indices and dense_shape must have dtype=int64")
-    else:
-      with ops.name_scope(None, "SparseTensor", [indices, values, dense_shape]):
-        indices = ops.convert_to_tensor(
-            indices, name="indices", dtype=dtypes.int64)
-        # TODO(touts): Consider adding mutable_values() when 'values'
-        # is a VariableOp and updating users of SparseTensor.
-        values = ops.internal_convert_to_tensor(values, name="values")
-        dense_shape = ops.convert_to_tensor(
-            dense_shape, name="dense_shape", dtype=dtypes.int64)
+    with ops.name_scope(None, "SparseTensor", [indices, values, dense_shape]):
+      indices = ops.convert_to_tensor(
+          indices, name="indices", dtype=dtypes.int64)
+      # TODO(touts): Consider adding mutable_values() when 'values'
+      # is a VariableOp and updating users of SparseTensor.
+      values = ops.convert_to_tensor(values, name="values")
+      dense_shape = ops.convert_to_tensor(
+          dense_shape, name="dense_shape", dtype=dtypes.int64)
     self._indices = indices
     self._values = values
     self._dense_shape = dense_shape
@@ -262,34 +255,44 @@ class SparseTensor(_TensorLike, composite_tensor.CompositeTensor):
 SparseTensorValue = collections.namedtuple("SparseTensorValue",
                                            ["indices", "values", "dense_shape"])
 tf_export(v1=["SparseTensorValue"])(SparseTensorValue)
-pywrap_tensorflow.RegisterType("SparseTensorValue", SparseTensorValue)
+_pywrap_utils.RegisterType("SparseTensorValue", SparseTensorValue)
 
 
-# TODO(b/133606651) Export this as tf.SparseTensorSpec.
+@tf_export("SparseTensorSpec")
 class SparseTensorSpec(type_spec.BatchableTypeSpec):
   """Type specification for a `tf.SparseTensor`."""
 
-  __slots__ = ["_dense_shape", "_dtype"]
+  __slots__ = ["_shape", "_dtype"]
 
   value_type = property(lambda self: SparseTensor)
 
-  def __init__(self, dense_shape=None, dtype=dtypes.float32):
+  def __init__(self, shape=None, dtype=dtypes.float32):
     """Constructs a type specification for a `tf.SparseTensor`.
 
     Args:
-      dense_shape: The dense shape of the `SparseTensor`, or `None` to allow
+      shape: The dense shape of the `SparseTensor`, or `None` to allow
         any dense shape.
       dtype: `tf.DType` of values in the `SparseTensor`.
     """
-    self._dense_shape = tensor_shape.as_shape(dense_shape)
+    self._shape = tensor_shape.as_shape(shape)
     self._dtype = dtypes.as_dtype(dtype)
 
   def _serialize(self):
-    return (self._dense_shape, self._dtype)
+    return (self._shape, self._dtype)
+
+  @property
+  def dtype(self):
+    """The `tf.dtypes.DType` specified by this type for the SparseTensor."""
+    return self._dtype
+
+  @property
+  def shape(self):
+    """The `tf.TensorShape` specified by this type for the SparseTensor."""
+    return self._shape
 
   @property
   def _component_specs(self):
-    rank = self._dense_shape.ndims
+    rank = self._shape.ndims
     num_values = None
     return [
         tensor_spec.TensorSpec([num_values, rank], dtypes.int64),
@@ -302,7 +305,11 @@ class SparseTensorSpec(type_spec.BatchableTypeSpec):
     return [value.indices, value.values, value.dense_shape]
 
   def _from_components(self, tensor_list):
-    return SparseTensor(*tensor_list)
+    if (all(isinstance(t, np.ndarray) for t in tensor_list) and
+        not tf2.enabled()):
+      return SparseTensorValue(*tensor_list)
+    else:
+      return SparseTensor(*tensor_list)
 
   # The SparseTensorSpec tensor_list encoding uses (de)serialize_sparse ops
   # to (un)box the component tensors in a way that allows for batching &
@@ -323,7 +330,7 @@ class SparseTensorSpec(type_spec.BatchableTypeSpec):
 
   def _to_batched_tensor_list(self, value):
     dense_shape = tensor_util.constant_value_as_shape(value.dense_shape)
-    if self._dense_shape.merge_with(dense_shape).ndims == 0:
+    if self._shape.merge_with(dense_shape).ndims == 0:
       raise ValueError(
           "Unbatching a sparse tensor is only supported for rank >= 1")
     return [gen_sparse_ops.serialize_many_sparse(
@@ -332,27 +339,44 @@ class SparseTensorSpec(type_spec.BatchableTypeSpec):
 
   def _from_compatible_tensor_list(self, tensor_list):
     tensor_list = gen_sparse_ops.deserialize_sparse(tensor_list[0], self._dtype)
-    result = SparseTensor(*tensor_list)
-    rank = self._dense_shape.ndims
-    result.indices.set_shape([None, rank])
-    result.dense_shape.set_shape([rank])
-    return result
+    indices, values, dense_shape = tensor_list
+    rank = self._shape.ndims
+    indices.set_shape([None, rank])
+    # We restore the dense_shape from the SparseTypeSpec. This is necessary
+    # for shape inference when using placeholder SparseTensors in function
+    # tracing.
+    if self._shape.is_fully_defined():
+      dense_shape = ops.convert_to_tensor(
+          self._shape, dtype=dtypes.int64, name="shape")
+    elif (self._shape.rank is not None and
+          any(dim.value is not None for dim in self._shape.dims)):
+      # array_ops imports sparse_tensor.py. Local import to avoid import cycle.
+      from tensorflow.python.ops import array_ops  # pylint: disable=g-import-not-at-top
+      pieces = array_ops.unstack(dense_shape, num=self._shape.rank)
+      for i, dim in enumerate(self._shape.dims):
+        if dim.value is not None:
+          pieces[i] = constant_op.constant(dim.value, dense_shape.dtype)
+      dense_shape = array_ops.stack(pieces)
+    else:
+      dense_shape.set_shape([rank])
+
+    return SparseTensor(indices, values, dense_shape)
 
   def _batch(self, batch_size):
     return SparseTensorSpec(
-        tensor_shape.TensorShape([batch_size]).concatenate(self._dense_shape),
+        tensor_shape.TensorShape([batch_size]).concatenate(self._shape),
         self._dtype)
 
   def _unbatch(self):
-    if self._dense_shape.ndims == 0:
+    if self._shape.ndims == 0:
       raise ValueError("Unbatching a tensor is only supported for rank >= 1")
-    return SparseTensorSpec(self._dense_shape[1:], self._dtype)
+    return SparseTensorSpec(self._shape[1:], self._dtype)
 
   def _to_legacy_output_types(self):
     return self._dtype
 
   def _to_legacy_output_shapes(self):
-    return self._dense_shape
+    return self._shape
 
   def _to_legacy_output_classes(self):
     return SparseTensor
@@ -405,7 +429,7 @@ def convert_to_tensor_or_sparse_tensor(value, dtype=None, name=None):
       raise RuntimeError("Sparse dtype: requested = %s, actual = %s" %
                          (dtype.name, value.dtype.name))
     return value
-  return ops.internal_convert_to_tensor(value, dtype=dtype, name=name)
+  return ops.convert_to_tensor(value, dtype=dtype, name=name)
 
 
 def is_sparse(x):

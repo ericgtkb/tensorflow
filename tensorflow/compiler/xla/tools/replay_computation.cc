@@ -86,8 +86,7 @@ namespace {
 // Command-line opts to this tool.  See main() for descriptions of these
 // fields.
 struct Options {
-  Options()
-      : intra_op_thread_pool_size(tensorflow::port::NumSchedulableCPUs()) {}
+  Options() : intra_op_thread_pool_size(tensorflow::port::MaxParallelism()) {}
 
   bool NeedsRealData() const { return !use_fake_data && !compile_only; }
 
@@ -347,10 +346,10 @@ StatusOr<std::vector<HloSnapshot>> ParseRecordIoFile(absl::string_view filename,
 
   std::vector<HloSnapshot> snapshots;
   uint64 offset = 0;
-  string record;
+  tensorflow::tstring record;
   while (reader.ReadRecord(&offset, &record).ok()) {
     HloSnapshot snapshot;
-    if (snapshot.mutable_hlo()->ParseFromString(record)) {
+    if (snapshot.mutable_hlo()->ParseFromStringPiece(record)) {
       snapshots.push_back(std::move(snapshot));
     } else {
       LOG(ERROR) << "Encountered bad proto";
@@ -392,7 +391,7 @@ StatusOr<HloSnapshot> ParseSingleHloFile(const string& filename,
   HloModuleConfig config;
   config.set_debug_options(GetDebugOptionsFromFlags());
   StatusOr<std::unique_ptr<HloModule>> module =
-      ParseHloString(contents, config);
+      ParseAndReturnUnverifiedModule(contents, config);
   if (module.ok()) {
     *snapshot.mutable_hlo()->mutable_hlo_module() =
         module.ValueOrDie()->ToProto();

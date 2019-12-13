@@ -26,7 +26,6 @@ import numpy as np
 from six.moves import zip  # pylint: disable=redefined-builtin
 
 from tensorflow.python.keras import backend as K
-from tensorflow.python.keras import losses
 from tensorflow.python.keras import optimizers
 from tensorflow.python.keras.saving import model_config as model_config_lib
 from tensorflow.python.keras.saving import saving_utils
@@ -76,6 +75,12 @@ def save_model_to_hdf5(model, filepath, overwrite=True, include_optimizer=True):
   # TODO(psv) Add warning when we save models that contain non-serializable
   # entities like metrics added using `add_metric` and losses added using
   # `add_loss.`
+  if len(model.weights) != len(model._undeduplicated_weights):
+    logging.warning('Found duplicated `Variable`s in Model\'s `weights`. '
+                    'This is usually caused by `Variable`s being shared by '
+                    'Layers in the Model. These `Variable`s will be treated '
+                    'as separate `Variable`s when the Model is restored. To '
+                    'avoid this, please save with `save_format="tf"`.')
 
   if not isinstance(filepath, h5py.File):
     # If file exists and should not be overwritten.
@@ -146,31 +151,6 @@ def load_model_from_hdf5(filepath, custom_objects=None, compile=True):  # pylint
   if not custom_objects:
     custom_objects = {}
 
-  def convert_custom_objects(obj):
-    """Handles custom object lookup.
-
-    Arguments:
-        obj: object, dict, or list.
-
-    Returns:
-        The same structure, where occurrences
-            of a custom object name have been replaced
-            with the custom object.
-    """
-    if isinstance(obj, list):
-      deserialized = []
-      for value in obj:
-        deserialized.append(convert_custom_objects(value))
-      return deserialized
-    if isinstance(obj, dict):
-      deserialized = {}
-      for key, value in obj.items():
-        deserialized[key] = convert_custom_objects(value)
-      return deserialized
-    if obj in custom_objects:
-      return custom_objects[obj]
-    return obj
-
   opened_new_file = not isinstance(filepath, h5py.File)
   if opened_new_file:
     f = h5py.File(filepath, mode='r')
@@ -198,29 +178,10 @@ def load_model_from_hdf5(filepath, custom_objects=None, compile=True):  # pylint
                         'the model was *not* compiled. Compile it manually.')
         return model
       training_config = json.loads(training_config.decode('utf-8'))
-      optimizer_config = training_config['optimizer_config']
-      optimizer = optimizers.deserialize(
-          optimizer_config, custom_objects=custom_objects)
-
-      # Recover loss functions and metrics.
-      loss_config = training_config['loss']  # Deserialize loss class.
-      if isinstance(loss_config, dict) and 'class_name' in loss_config:
-        loss_config = losses.get(loss_config)
-      loss = convert_custom_objects(loss_config)
-      metrics = convert_custom_objects(training_config['metrics'])
-      weighted_metrics = convert_custom_objects(
-          training_config.get('weighted_metrics', None))
-      sample_weight_mode = training_config['sample_weight_mode']
-      loss_weights = training_config['loss_weights']
 
       # Compile model.
-      model.compile(
-          optimizer=optimizer,
-          loss=loss,
-          metrics=metrics,
-          weighted_metrics=weighted_metrics,
-          loss_weights=loss_weights,
-          sample_weight_mode=sample_weight_mode)
+      model.compile(**saving_utils.compile_args_from_training_config(
+          training_config, custom_objects))
 
       # Set optimizer weights.
       if 'optimizer_weights' in f:
@@ -317,30 +278,30 @@ def preprocess_weights_for_loading(layer,
     Returns:
         A list of weights values (Numpy arrays).
     """
-    new_weights = []
-    # trainable weights
-    for sublayer in layer.layers:
-      num_weights = len(sublayer.trainable_weights)
-      if num_weights > 0:
-        new_weights.extend(preprocess_weights_for_loading(
-            layer=sublayer,
-            weights=weights[:num_weights],
-            original_keras_version=original_keras_version,
-            original_backend=original_backend))
-        weights = weights[num_weights:]
+    trainable_weights = weights[:len(layer.trainable_weights)]
+    non_trainable_weights = weights[len(layer.trainable_weights):]
 
-    # non-trainable weights
+    new_trainable_weights = []
+    new_non_trainable_weights = []
+
     for sublayer in layer.layers:
-      num_weights = len([l for l in sublayer.weights
-                         if l not in sublayer.trainable_weights])
-      if num_weights > 0:
-        new_weights.extend(preprocess_weights_for_loading(
+      num_trainable_weights = len(sublayer.trainable_weights)
+      num_non_trainable_weights = len(sublayer.non_trainable_weights)
+      if sublayer.weights:
+        preprocessed = preprocess_weights_for_loading(
             layer=sublayer,
-            weights=weights[:num_weights],
+            weights=(trainable_weights[:num_trainable_weights] +
+                     non_trainable_weights[:num_non_trainable_weights]),
             original_keras_version=original_keras_version,
-            original_backend=original_backend))
-        weights = weights[num_weights:]
-    return new_weights
+            original_backend=original_backend)
+        new_trainable_weights.extend(preprocessed[:num_trainable_weights])
+        new_non_trainable_weights.extend(preprocessed[num_trainable_weights:])
+
+        trainable_weights = trainable_weights[num_trainable_weights:]
+        non_trainable_weights = non_trainable_weights[
+            num_non_trainable_weights:]
+
+    return new_trainable_weights + new_non_trainable_weights
 
   # Convert layers nested in Bidirectional/Model/Sequential.
   # Both transformation should be ran for both Keras 1->2 conversion
@@ -738,7 +699,8 @@ def load_weights_from_hdf5_group(f, layers):
   K.batch_set_value(weight_value_tuples)
 
 
-def load_weights_from_hdf5_group_by_name(f, layers):
+def load_weights_from_hdf5_group_by_name(
+    f, layers, skip_mismatch=False):
   """Implements name-based weight loading.
 
   (instead of topological weight loading).
@@ -748,10 +710,13 @@ def load_weights_from_hdf5_group_by_name(f, layers):
   Arguments:
       f: A pointer to a HDF5 group.
       layers: a list of target layers.
+      skip_mismatch: Boolean, whether to skip loading of layers
+          where there is a mismatch in the number of weights,
+          or a mismatch in the shape of the weights.
 
   Raises:
       ValueError: in case of mismatch between provided layers
-          and weights file.
+          and weights file and skip_match=False.
   """
   if 'keras_version' in f.attrs:
     original_keras_version = f.attrs['keras_version'].decode('utf8')
@@ -784,6 +749,12 @@ def load_weights_from_hdf5_group_by_name(f, layers):
       weight_values = preprocess_weights_for_loading(
           layer, weight_values, original_keras_version, original_backend)
       if len(weight_values) != len(symbolic_weights):
+        if skip_mismatch:
+          logging.warning('Skipping loading of weights for '
+                          'layer {}'.format(layer.name) + ' due to mismatch '
+                          'in number of weights ({} vs {}).'.format(
+                              len(symbolic_weights), len(weight_values)))
+          continue
         raise ValueError('Layer #' + str(k) + ' (named "' + layer.name +
                          '") expects ' + str(len(symbolic_weights)) +
                          ' weight(s), but the saved weights' + ' have ' +
@@ -791,6 +762,13 @@ def load_weights_from_hdf5_group_by_name(f, layers):
       # Set values.
       for i in range(len(weight_values)):
         if K.int_shape(symbolic_weights[i]) != weight_values[i].shape:
+          if skip_mismatch:
+            logging.warning('Skipping loading of weights for '
+                            'layer {}'.format(layer.name) + ' due to '
+                            'mismatch in shape ({} vs {}).'.format(
+                                symbolic_weights[i].shape,
+                                weight_values[i].shape))
+            continue
           raise ValueError('Layer #' + str(k) +' (named "' + layer.name +
                            '"), weight ' + str(symbolic_weights[i]) +
                            ' has shape {}'.format(K.int_shape(

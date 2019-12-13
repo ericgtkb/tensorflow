@@ -15,6 +15,7 @@ limitations under the License.
 #include "tensorflow/core/kernels/data/interleave_dataset_op.h"
 
 #include "tensorflow/core/common_runtime/function.h"
+#include "tensorflow/core/common_runtime/input_colocation_exemption_registry.h"
 #include "tensorflow/core/framework/model.h"
 #include "tensorflow/core/framework/partial_tensor_shape.h"
 #include "tensorflow/core/framework/tensor.h"
@@ -80,6 +81,11 @@ class InterleaveDatasetOp::Dataset : public DatasetBase {
     return name_utils::DatasetDebugString(kDatasetType);
   }
 
+  Status CheckExternalState() const override {
+    TF_RETURN_IF_ERROR(captured_func_->CheckExternalState());
+    return input_->CheckExternalState();
+  }
+
  protected:
   Status AsGraphDefInternal(SerializationContext* ctx,
                             DatasetGraphDefBuilder* b,
@@ -113,6 +119,12 @@ class InterleaveDatasetOp::Dataset : public DatasetBase {
         : DatasetIterator<Dataset>(params),
           current_elements_(params.dataset->cycle_length_),
           args_list_(params.dataset->cycle_length_) {}
+
+    string BuildTraceMeName() override {
+      return strings::StrCat(prefix(),
+                             "#cycle_length=", dataset()->cycle_length_,
+                             ",block_length=", dataset()->block_length_, "#");
+    }
 
     Status Initialize(IteratorContext* ctx) override {
       TF_RETURN_IF_ERROR(
@@ -284,8 +296,10 @@ class InterleaveDatasetOp::Dataset : public DatasetBase {
 
 InterleaveDatasetOp::InterleaveDatasetOp(OpKernelConstruction* ctx)
     : UnaryDatasetOpKernel(ctx), graph_def_version_(ctx->graph_def_version()) {
-  OP_REQUIRES_OK(ctx, FunctionMetadata::Create(ctx, kFunc, /*params=*/{},
-                                               &func_metadata_));
+  FunctionMetadata::Params params;
+  params.is_multi_device_function = true;
+  OP_REQUIRES_OK(ctx,
+                 FunctionMetadata::Create(ctx, kFunc, params, &func_metadata_));
   OP_REQUIRES_OK(ctx, ctx->GetAttr(kOutputTypes, &output_types_));
   OP_REQUIRES_OK(ctx, ctx->GetAttr(kOutputShapes, &output_shapes_));
 }
@@ -294,8 +308,8 @@ void InterleaveDatasetOp::MakeDataset(OpKernelContext* ctx, DatasetBase* input,
                                       DatasetBase** output) {
   int64 cycle_length = 0;
   OP_REQUIRES_OK(ctx, ParseScalarArgument(ctx, kCycleLength, &cycle_length));
-  if (cycle_length == model::kAutoTune) {
-    cycle_length = port::NumSchedulableCPUs();
+  if (cycle_length == model::kAutotune) {
+    cycle_length = port::MaxParallelism();
   }
   OP_REQUIRES(
       ctx, cycle_length > 0,
@@ -319,6 +333,7 @@ void InterleaveDatasetOp::MakeDataset(OpKernelContext* ctx, DatasetBase* input,
 namespace {
 REGISTER_KERNEL_BUILDER(Name("InterleaveDataset").Device(DEVICE_CPU),
                         InterleaveDatasetOp);
+REGISTER_INPUT_COLOCATION_EXEMPTION("InterleaveDataset");
 }  // namespace
 }  // namespace data
 }  // namespace tensorflow

@@ -22,11 +22,17 @@ import sys
 
 import numpy as np
 
+from tensorflow.python.distribute import distribution_strategy_context as ds_context
+from tensorflow.python.eager import context
+from tensorflow.python.framework import composite_tensor
 from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import ops
+from tensorflow.python.framework import tensor_spec
+from tensorflow.python.framework import type_spec
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import gen_stateful_random_ops
 from tensorflow.python.ops import math_ops
+from tensorflow.python.ops import resource_variable_ops
 from tensorflow.python.ops import variables
 from tensorflow.python.training.tracking import tracking
 from tensorflow.python.util.tf_export import tf_export
@@ -133,6 +139,12 @@ def _get_state_size(alg):
     raise ValueError("Unsupported algorithm id: %s" % alg)
 
 
+def _check_state_shape(shape, alg):
+  if isinstance(alg, ops.Tensor) and not context.executing_eagerly():
+    return
+  shape.assert_is_compatible_with([_get_state_size(int(alg))])
+
+
 def _make_state_from_seed(seed, alg):
   return _make_1d_state(_get_state_size(alg), seed)
 
@@ -167,8 +179,64 @@ def _convert_to_state_tensor(t):
   return ops.convert_to_tensor(t, dtype=STATE_TYPE)
 
 
+class GeneratorSpec(type_spec.TypeSpec):
+  """TypeSpec for Generator."""
+
+  def __init__(self, shape=None, dtype=None):
+    self.shape = shape
+    self.dtype = dtype
+
+  @property
+  def _component_specs(self):
+    return (tensor_spec.TensorSpec(shape=(), dtype=dtypes.resource),
+            tensor_spec.TensorSpec(shape=(), dtype=ALGORITHM_TYPE))
+
+  def _to_components(self, value):
+    return (value.state.handle, ops.convert_to_tensor(value.algorithm,
+                                                      dtype=ALGORITHM_TYPE))
+
+  def _from_components(self, components):
+    assert isinstance(components, (list, tuple))
+    assert len(components) == 2
+    handle = components[0]
+    alg = components[1]
+    state_var = resource_variable_ops.BaseResourceVariable(
+        handle=handle, shape=self.shape, dtype=self.dtype,
+        trainable=False, handle_deleter=object(), handle_name="RNGVar")
+    return Generator(state=state_var, alg=alg)
+
+  @property
+  def value_type(self):
+    return Generator
+
+  def _serialize(self):
+    return (self.shape, self.dtype)
+
+
+def _create_variable(*args, **kwargs):
+  """Creates a variable, and check that it's not MirroredVariable.
+
+  Args:
+    *args: positional arguments passed along to `variables.Variable.
+    **kwargs: keyword arguments passed along to `variables.Variable.
+
+  Returns:
+    The created variable.
+  """
+  if ds_context.has_strategy():
+    raise ValueError(
+        "Creating a generator within a strategy scope is disallowed, because "
+        "there is ambiguity on how to replicate a generator (e.g. should it be "
+        "copied so such each replica will get the same random numbers, or "
+        "should it be 'split' into different generators that generate "
+        "different random numbers).")
+    # TODO(wangpeng): Link to the RNG guide for solutions in such cases.
+  var = variables.Variable(*args, **kwargs)
+  return var
+
+
 @tf_export("random.experimental.Generator")
-class Generator(tracking.AutoTrackable):
+class Generator(tracking.AutoTrackable, composite_tensor.CompositeTensor):
   """Random-number generator.
 
   It uses Variable to manage its internal state, and allows choosing an
@@ -186,32 +254,48 @@ class Generator(tracking.AutoTrackable):
     decreasing precedence:
     (1) If `copy_from` is not None, the new generator is initialized by copying
         information from another generator.
-    (3) If `state` and `alg` are not None (they must be set together), the new
+    (2) If `state` and `alg` are not None (they must be set together), the new
         generator is initialized by a state.
 
     Args:
       copy_from: a generator to be copied from.
       state: a vector of dtype STATE_TYPE representing the initial state of the
-        RNG, whose length and semantics are algorithm-specific.
-      alg: the RNG algorithm. Possible values are RNG_ALG_PHILOX for the
-        Philox algorithm and RNG_ALG_THREEFRY for the ThreeFry
+        RNG, whose length and semantics are algorithm-specific. If it's a
+        variable, the generator will reuse it instead of creating a new
+        variable.
+      alg: the RNG algorithm. Possible values are `RNG_ALG_PHILOX` for the
+        Philox algorithm and `RNG_ALG_THREEFRY` for the ThreeFry
         algorithm (see paper 'Parallel Random Numbers: As Easy as 1, 2, 3'
         [https://www.thesalmons.org/john/random123/papers/random123sc11.pdf]).
+        Note `RNG_ALG_PHILOX` guarantees the same numbers are produced (given
+        the same random state) across all architextures (CPU, GPU, XLA etc).
+
+    Throws:
+      ValueError: if the generator is created inside a synchronous
+        `tf.distribute` strategy such as `MirroredStrategy` or `TPUStrategy`,
+        because there is ambiguity on how to replicate a generator (e.g. should
+        it be copied so such each replica will get the same random numbers, or
+        should it be "split" into different generators that generate
+        different random numbers).
     """
     if copy_from is not None:
       # All other arguments should be None
       assert (alg or state) is None
-      self._state_var = variables.Variable(copy_from.state, dtype=STATE_TYPE,
-                                           trainable=False)
-      self._alg_var = copy_from.algorithm
+      self._state_var = _create_variable(copy_from.state, dtype=STATE_TYPE,
+                                         trainable=False)
+      self._alg = copy_from.algorithm
 
     else:
       assert alg is not None and state is not None
-      state = _convert_to_state_tensor(state)
-      state.shape.assert_is_compatible_with([_get_state_size(alg)])
-      self._state_var = variables.Variable(state, dtype=STATE_TYPE,
+      if isinstance(state, variables.Variable):
+        _check_state_shape(state.shape, alg)
+        self._state_var = state
+      else:
+        state = _convert_to_state_tensor(state)
+        _check_state_shape(state.shape, alg)
+        self._state_var = _create_variable(state, dtype=STATE_TYPE,
                                            trainable=False)
-      self._alg_var = alg
+      self._alg = alg
 
   @classmethod
   def from_state(cls, state, alg):
@@ -225,6 +309,14 @@ class Generator(tracking.AutoTrackable):
 
     Returns:
       The new generator.
+
+    Throws:
+      ValueError: if the generator is created inside a synchronous
+        `tf.distribute` strategy such as `MirroredStrategy` or `TPUStrategy`,
+        because there is ambiguity on how to replicate a generator (e.g. should
+        it be copied so such each replica will get the same random numbers, or
+        should it be "split" into different generators that generate
+        different random numbers).
     """
     return cls(alg=alg, state=state)
 
@@ -246,6 +338,14 @@ class Generator(tracking.AutoTrackable):
 
     Returns:
       The new generator.
+
+    Throws:
+      ValueError: if the generator is created inside a synchronous
+        `tf.distribute` strategy such as `MirroredStrategy` or `TPUStrategy`,
+        because there is ambiguity on how to replicate a generator (e.g. should
+        it be copied so such each replica will get the same random numbers, or
+        should it be "split" into different generators that generate
+        different random numbers).
     """
     if alg is None:
       # TODO(wangpeng): more sophisticated algorithm selection
@@ -265,6 +365,14 @@ class Generator(tracking.AutoTrackable):
 
     Returns:
       The new generator.
+
+    Throws:
+      ValueError: if the generator is created inside a synchronous
+        `tf.distribute` strategy such as `MirroredStrategy` or `TPUStrategy`,
+        because there is ambiguity on how to replicate a generator (e.g. should
+        it be copied so such each replica will get the same random numbers, or
+        should it be "split" into different generators that generate
+        different random numbers).
     """
     if alg is None:
       # TODO(wangpeng): more sophisticated algorithm selection
@@ -289,6 +397,14 @@ class Generator(tracking.AutoTrackable):
 
     Returns:
       The new generator.
+
+    Throws:
+      ValueError: if the generator is created inside a synchronous
+        `tf.distribute` strategy such as `MirroredStrategy` or `TPUStrategy`,
+        because there is ambiguity on how to replicate a generator (e.g. should
+        it be copied so such each replica will get the same random numbers, or
+        should it be "split" into different generators that generate
+        different random numbers).
     """
     counter = _convert_to_state_tensor(counter)
     key = _convert_to_state_tensor(key)
@@ -340,6 +456,10 @@ class Generator(tracking.AutoTrackable):
     self._state_var.assign(state)
 
   @property
+  def _type_spec(self):
+    return GeneratorSpec(shape=self.state.shape, dtype=self.state.dtype)
+
+  @property
   def state(self):
     """The internal state of the RNG."""
     return self._state_var
@@ -347,7 +467,7 @@ class Generator(tracking.AutoTrackable):
   @property
   def algorithm(self):
     """The RNG algorithm."""
-    return self._alg_var
+    return self._alg
 
   def _standard_normal(self, shape, dtype):
     return gen_stateful_random_ops.stateful_standard_normal_v2(
@@ -541,25 +661,38 @@ class Generator(tracking.AutoTrackable):
     ```python
     counts = [10., 20.]
     # Probability of success.
-    probs = [0.8, 0.9]
+    probs = [0.8]
 
-    rng = tf.random.experimental.Generator(seed=234)
+    rng = tf.random.experimental.Generator.from_seed(seed=234)
     binomial_samples = rng.binomial(shape=[2], counts=counts, probs=probs)
+
+
+    counts = ... # Shape [3, 1, 2]
+    probs = ...  # Shape [1, 4, 2]
+    shape = [3, 4, 3, 4, 2]
+    rng = tf.random.experimental.Generator.from_seed(seed=1717)
+    # Sample shape will be [3, 4, 3, 4, 2]
+    binomial_samples = rng.binomial(shape=shape, counts=counts, probs=probs)
     ```
 
 
     Args:
       shape: A 1-D integer Tensor or Python array. The shape of the output
         tensor.
-      counts: A 0/1-D Tensor or Python value`. The counts of the binomial
-        distribution.
-      probs: A 0/1-D Tensor or Python value`. The probability of success for the
-        binomial distribution.
+      counts: Tensor. The counts of the binomial distribution. Must be
+        broadcastable with `probs`, and broadcastable with the rightmost
+        dimensions of `shape`.
+      probs: Tensor. The probability of success for the
+        binomial distribution. Must be broadcastable with `counts` and
+        broadcastable with the rightmost dimensions of `shape`.
       dtype: The type of the output. Default: tf.int32
       name: A name for the operation (optional).
 
     Returns:
-      A tensor of the specified shape filled with random binomial values.
+      samples: A Tensor of the specified shape filled with random binomial
+        values.  For each i, each samples[i, ...] is an independent draw from
+        the binomial distribution on counts[i] trials with probability of
+        success probs[i].
     """
     dtype = dtypes.as_dtype(dtype)
     with ops.name_scope(name, "binomial", [shape, counts, probs]) as name:
@@ -675,7 +808,8 @@ global_generator = None
 def get_global_generator():
   global global_generator
   if global_generator is None:
-    global_generator = Generator.from_non_deterministic_state()
+    with ops.init_scope():
+      global_generator = Generator.from_non_deterministic_state()
   return global_generator
 
 

@@ -30,6 +30,7 @@ limitations under the License.
 
 namespace tensorflow {
 namespace data {
+namespace experimental {
 namespace {
 
 static mutex* get_counters_map_lock() {
@@ -200,8 +201,7 @@ class StatsAggregatorImplV2 : public StatsAggregator {
     }
     std::unique_ptr<Event> e{new Event};
     e->set_step(steps);
-    tensorflow::Env* env = tensorflow::Env::Default();
-    e->set_wall_time(env->NowMicros() / 1.0e6);
+    e->set_wall_time(EnvTime::NowMicros() / 1.0e6);
     // maybe expose GetWallTime in SummaryWriterInterface
     Summary::Value* v = e->mutable_summary()->add_value();
     v->set_tag(name);
@@ -217,8 +217,7 @@ class StatsAggregatorImplV2 : public StatsAggregator {
     }
     std::unique_ptr<Event> e{new Event};
     e->set_step(steps);
-    tensorflow::Env* env = tensorflow::Env::Default();
-    e->set_wall_time(env->NowMicros() / 1.0e6);
+    e->set_wall_time(EnvTime::NowMicros() / 1.0e6);
     Summary::Value* v = e->mutable_summary()->add_value();
     v->set_tag(name);
     histogram.EncodeToProto(v->mutable_histo(), false /* Drop zero buckets */);
@@ -266,7 +265,7 @@ class StatsAggregatorSummaryOp : public OpKernel {
     OP_REQUIRES_OK(ctx, ctx->allocate_output(0, TensorShape({}), &summary_t));
     Summary summary;
     resource->stats_aggregator()->EncodeToProto(&summary);
-    summary_t->scalar<string>()() = summary.SerializeAsString();
+    summary_t->scalar<tstring>()() = summary.SerializeAsString();
   }
 };
 
@@ -296,18 +295,26 @@ class StatsAggregatorSetSummaryWriterOp : public OpKernel {
   }
 };
 
+REGISTER_KERNEL_BUILDER(Name("StatsAggregatorHandle").Device(DEVICE_CPU),
+                        StatsAggregatorHandleOp);
 REGISTER_KERNEL_BUILDER(
     Name("ExperimentalStatsAggregatorHandle").Device(DEVICE_CPU),
     StatsAggregatorHandleOp);
+
 REGISTER_KERNEL_BUILDER(Name("StatsAggregatorHandleV2").Device(DEVICE_CPU),
                         StatsAggregatorHandleOpV2);
+
+REGISTER_KERNEL_BUILDER(Name("StatsAggregatorSummary").Device(DEVICE_CPU),
+                        StatsAggregatorSummaryOp);
 REGISTER_KERNEL_BUILDER(
     Name("ExperimentalStatsAggregatorSummary").Device(DEVICE_CPU),
     StatsAggregatorSummaryOp);
+
 REGISTER_KERNEL_BUILDER(
     Name("StatsAggregatorSetSummaryWriter").Device(DEVICE_CPU),
     StatsAggregatorSetSummaryWriterOp);
 
 }  // namespace
+}  // namespace experimental
 }  // namespace data
 }  // namespace tensorflow

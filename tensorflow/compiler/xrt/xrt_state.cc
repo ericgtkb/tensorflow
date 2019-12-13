@@ -194,18 +194,49 @@ void XRTTupleAllocation::ReleaseBuffers() {
   return Status::OK();
 }
 
+/*static*/ Status XRTTupleAllocation::CreateUninitialized(
+    const xla::Shape& shape, XRTMemoryManager* memory_manager,
+    xla::Backend* backend, int device_ordinal,
+    XRTTupleAllocation** allocation) {
+  std::unique_ptr<xla::ScopedShapedBuffer> scoped_buffer;
+  TF_RETURN_IF_ERROR(AllocateScopedShapedBuffer(
+      memory_manager, backend, device_ordinal, shape, &scoped_buffer));
+
+  // By releasing the ScopedShapedBuffer we ensure that the underlying storage
+  // won't be freed when the buffer goes out of scope at the end of this
+  // call. To avoid a leak, there must be no error-case returns from here until
+  // the end of the method.
+  auto shaped_buffer = scoped_buffer->release();
+  *allocation = new XRTTupleAllocation(
+      device_ordinal, backend->memory_allocator(),
+      shaped_buffer.on_host_shape(), shaped_buffer.on_device_shape());
+  (*allocation)
+      ->InitializeFromShapedBuffer(shaped_buffer, backend->memory_allocator(),
+                                   device_ordinal);
+  (*allocation)->SetDeviceMemorySize();
+  return Status::OK();
+}
+
 /*static*/ Status XRTTupleAllocation::CreateFromBuffer(
-    const xla::ShapedBuffer& shaped_buffer, xla::Backend* backend,
+    const xla::ShapedBuffer& shaped_buffer, const xla::Shape& on_host_shape,
+    const xla::Shape& on_device_shape, xla::Backend* backend,
     int device_ordinal, XRTTupleAllocation** allocation) {
   auto allocator = backend->memory_allocator();
 
-  *allocation = new XRTTupleAllocation(device_ordinal, allocator,
-                                       shaped_buffer.on_host_shape(),
-                                       shaped_buffer.on_device_shape());
+  *allocation = new XRTTupleAllocation(device_ordinal, allocator, on_host_shape,
+                                       on_device_shape);
   (*allocation)
       ->InitializeFromShapedBuffer(shaped_buffer, allocator, device_ordinal);
   (*allocation)->SetDeviceMemorySize();
   return Status::OK();
+}
+
+/*static*/ Status XRTTupleAllocation::CreateFromBuffer(
+    const xla::ShapedBuffer& shaped_buffer, xla::Backend* backend,
+    int device_ordinal, XRTTupleAllocation** allocation) {
+  return CreateFromBuffer(shaped_buffer, shaped_buffer.on_host_shape(),
+                          shaped_buffer.on_device_shape(), backend,
+                          device_ordinal, allocation);
 }
 
 Status XRTTupleAllocation::ToLiteral(xla::Backend* backend,
@@ -221,7 +252,7 @@ Status XRTTupleAllocation::StoreToLiteral(xla::Backend* backend,
   TF_ASSIGN_OR_RETURN(auto stream, backend->BorrowStream(device_ordinal()));
   TF_ASSIGN_OR_RETURN(xla::ShapedBuffer shaped_buffer, ToShapedBuffer());
   return transfer_manager->TransferLiteralFromDevice(stream.get(),
-                                                     shaped_buffer, *literal);
+                                                     shaped_buffer, literal);
 }
 
 Status XRTTupleAllocation::WriteLiteral(xla::Backend* backend,
@@ -617,7 +648,8 @@ Status XRTTupleAllocation::AliasBufferFrom(const XRTTupleAllocation& source,
 
 xla::StatusOr<xla::ShapeTree<xla::MaybeOwningDeviceMemory>>
 XRTTupleAllocation::ToDeviceMemoryTree(
-    const std::function<bool(const xla::ShapeIndex&)>& release_checker) {
+    const std::function<xla::StatusOr<bool>(const xla::ShapeIndex&)>&
+        release_checker) {
   xla::ShapeTree<xla::MaybeOwningDeviceMemory> shaped_tree(on_device_shape());
   for (const auto& index_buffer : buffers_) {
     if (index_buffer.second == nullptr ||
@@ -626,7 +658,9 @@ XRTTupleAllocation::ToDeviceMemoryTree(
                                      index_buffer.first.ToString(),
                                      " has been released");
     }
-    if (!release_checker(index_buffer.first)) {
+    TF_ASSIGN_OR_RETURN(bool should_release,
+                        release_checker(index_buffer.first));
+    if (!should_release) {
       *shaped_tree.mutable_element(index_buffer.first) =
           index_buffer.second->allocation();
     } else {

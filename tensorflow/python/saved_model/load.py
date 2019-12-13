@@ -21,6 +21,7 @@ from __future__ import print_function
 import functools
 import os
 
+from tensorflow.core.protobuf import graph_debug_info_pb2
 from tensorflow.python.distribute import distribution_strategy_context as ds_context
 from tensorflow.python.distribute import values as ds_values
 from tensorflow.python.eager import context
@@ -31,6 +32,7 @@ from tensorflow.python.framework import ops
 from tensorflow.python.framework import tensor_util
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import control_flow_ops
+from tensorflow.python.ops import custom_gradient
 from tensorflow.python.ops import resource_variable_ops
 from tensorflow.python.ops import variables
 from tensorflow.python.saved_model import function_deserialization
@@ -48,10 +50,10 @@ from tensorflow.python.util.tf_export import tf_export
 
 
 def _unused_handle():
-  """Returns a placeholder as handle that is not supposed to be accessed."""
+  """Returns a placeholder as a handle that is not supposed to be accessed."""
   error_message = ("Trying to access a placeholder that is not supposed to be "
                    "executed. This means you are executing a graph generated "
-                   "from cross-replica context in an in-replica context.")
+                   "from the cross-replica context in an in-replica context.")
 
   assert_op = control_flow_ops.Assert(
       array_ops.placeholder_with_default(False, shape=()),
@@ -74,16 +76,14 @@ class _WrapperFunction(function.ConcreteFunction):
   not in-replica, calling the function should mean that it is constructing a
   graph that is not actually going to be used. A typical use case is when
   constructing a functional model. In this case, return a placeholder with a
-  control dependency to ensure that is is never accessed.
+  control dependency to ensure that is never accessed.
   """
 
   def __init__(self, concrete_function):
     # Shallow copy the concrete_function
     self.__dict__.update(vars(concrete_function))
 
-  def _call_flat(self, args, captured_inputs):
-    assert captured_inputs is self._captured_inputs
-    del captured_inputs
+  def _call_flat(self, args, captured_inputs, cancellation_manager=None):
 
     def get_in_replica_handle(x):
       return x.handle if ds_values.is_distributed_variable(x) else x
@@ -92,11 +92,12 @@ class _WrapperFunction(function.ConcreteFunction):
       return _unused_handle() if ds_values.is_distributed_variable(x) else x
 
     if ds_context.get_replica_context() is not None:  # in-replica context
-      captured_inputs = list(map(get_in_replica_handle, self._captured_inputs))
+      captured_inputs = list(map(get_in_replica_handle, captured_inputs))
     else:  # cross-replica context
       captured_inputs = list(
-          map(get_cross_replica_handle, self._captured_inputs))
-    return super(_WrapperFunction, self)._call_flat(args, captured_inputs)
+          map(get_cross_replica_handle, captured_inputs))
+    return super(_WrapperFunction, self)._call_flat(args, captured_inputs,
+                                                    cancellation_manager)
 
 
 class Loader(object):
@@ -176,10 +177,27 @@ class Loader(object):
       if bound_inputs:
         for bound_input, internal_capture in zip(
             bound_inputs, concrete_function.inputs[-len(bound_inputs):]):
-          concrete_function.graph.captures[bound_input] = internal_capture
-          # Setting "captures" first means "capture" won't create a new
-          # placeholder for this input.
-          concrete_function.graph.capture(bound_input)
+          if ds_values.is_distributed_variable(bound_input):
+            concrete_function.graph.capture_distributed_variable(
+                bound_input, internal_capture)
+          else:
+            concrete_function.graph.replace_capture(bound_input,
+                                                    internal_capture)
+            if internal_capture.dtype == dtypes.resource:
+              if resource_variable_ops.is_resource_variable(bound_input):
+                try:
+                  handle = bound_input.handle
+                except ValueError:
+                  # For mirrored variables we'll copy handle data for components
+                  # as they get captured.
+                  pass
+                else:
+                  custom_gradient.copy_handle_data(handle, internal_capture)
+              else:
+                custom_gradient.copy_handle_data(bound_input, internal_capture)
+            # Setting "captures" first means "capture" won't create a new
+            # placeholder for this input.
+            concrete_function.graph.capture(bound_input)
 
   def _get_tensor_from_node(self, node_id):
     """Resolves a node id into a tensor to be captured for a function."""
@@ -189,7 +207,7 @@ class Loader(object):
         return obj
       elif resource_variable_ops.is_resource_variable(obj):
         return obj.handle
-      elif isinstance(obj, tracking.TrackableAsset):
+      elif isinstance(obj, tracking.Asset):
         return obj.asset_path
       elif tensor_util.is_tensor(obj):
         return obj
@@ -283,6 +301,19 @@ class Loader(object):
               ("Missing functionality to restore state of object "
                "%r from the checkpoint." % obj))
 
+  def adjust_debug_info_func_names(self, debug_info):
+    """Rewrite func names in the debug info by using the concrete func names."""
+    output_debug_info = graph_debug_info_pb2.GraphDebugInfo()
+    output_debug_info.files[:] = debug_info.files
+    for key in debug_info.traces:
+      node, func = key.split("@")
+      new_func = ""
+      if func in self._concrete_functions:
+        new_func = self._concrete_functions[func].function_def.signature.name
+      output_debug_info.traces[node + "@" + new_func].CopyFrom(
+          debug_info.traces[key])
+    return output_debug_info
+
   def get(self, node_id):
     return self._nodes[node_id]
 
@@ -313,7 +344,7 @@ class Loader(object):
 
   def _recreate_base_user_object(self, proto):
     del proto
-    # Note: each user object has its own class. This allows to make each one
+    # Note: each user object has its own class. This allows making each one
     # individually callable by adding a `__call__` method to the classes of
     # the objects instances that have a `__call__` property.
 
@@ -326,7 +357,7 @@ class Loader(object):
     filename = os.path.join(
         saved_model_utils.get_assets_dir(self._export_dir),
         self._asset_file_def[proto.asset_file_def_index].filename)
-    return tracking.TrackableAsset(filename), setattr
+    return tracking.Asset(filename), setattr
 
   def _recreate_function(self, proto):
     return function_deserialization.recreate_function(
@@ -384,20 +415,37 @@ class Loader(object):
 class _RestoredResource(tracking.TrackableResource):
   """Restored SavedResource."""
 
+  def __init__(self, device=""):
+    super(_RestoredResource, self).__init__(device=device)
+    self._destroy_resource_fn = None
+
   def _create_resource(self):
     raise RuntimeError()
 
   def _initialize(self):
     raise RuntimeError()
 
+  @property
+  def _destroy_resource(self):
+    return self._destroy_resource_fn
+
+  @_destroy_resource.setter
+  def _destroy_resource(self, destroy_resource_fn):
+    self._resource_deleter = tracking.CapturableResourceDeleter(
+        destroy_resource_fn)
+    self._destroy_resource_fn = destroy_resource_fn
+
   def _list_functions_for_serialization(self, unused_serialization_cache):
     # Overwrite this method to avoid the implementation of
     # base class to re-wrap the polymorphic functions into
     # another layer of `tf.function`.
-    return {
+    functions = {
         "_create_resource": self._create_resource,
         "_initialize": self._initialize,
     }
+    if self._destroy_resource:
+      functions.update(_destroy_resource=self._destroy_resource)
+    return functions
 
 
 def _call_attribute(instance, *args, **kwargs):
@@ -467,17 +515,26 @@ def load(export_dir, tags=None):
   `tf.saved_model.save`, variables are instead assigned to whichever attributes
   they were assigned before export.
 
+  _Consuming SavedModels asynchronously_
+
+  When consuming SavedModels asynchronously (the producer is a separate
+  process), the SavedModel directory will appear before all files have been
+  written, and `tf.saved_model.load` will fail if pointed at an incomplete
+  SavedModel. Rather than checking for the directory, check for
+  "saved_model_dir/saved_model.pb". This file is written atomically as the last
+  `tf.saved_model.save` file operation.
+
   Args:
     export_dir: The SavedModel directory to load from.
     tags: A tag or sequence of tags identifying the MetaGraph to load. Optional
       if the SavedModel contains a single MetaGraph, as for those exported from
-      `tf.saved_model.load`.
+      `tf.saved_model.save`.
 
   Returns:
     A trackable object with a `signatures` attribute mapping from signature
     keys to functions. If the SavedModel was exported by `tf.saved_model.load`,
-    it also points to trackable objects and functions which were attached
-    to the exported object.
+    it also points to trackable objects, functions, debug info which it has been
+    saved.
 
   Raises:
     ValueError: If `tags` don't match a MetaGraph in the SavedModel.
@@ -491,9 +548,11 @@ def load_internal(export_dir, tags=None, loader_cls=Loader):
     # Supports e.g. tags=SERVING and tags=[SERVING]. Sets aren't considered
     # sequences for nest.flatten, so we put those through as-is.
     tags = nest.flatten(tags)
-  saved_model_proto = loader_impl.parse_saved_model(export_dir)
-  if (len(saved_model_proto.meta_graphs) == 1
-      and saved_model_proto.meta_graphs[0].HasField("object_graph_def")):
+  saved_model_proto, debug_info = (
+      loader_impl.parse_saved_model_with_debug_info(export_dir))
+
+  if (len(saved_model_proto.meta_graphs) == 1 and
+      saved_model_proto.meta_graphs[0].HasField("object_graph_def")):
     meta_graph_def = saved_model_proto.meta_graphs[0]
     if (tags is not None
         and set(tags) != set(meta_graph_def.meta_info_def.tags)):
@@ -508,10 +567,13 @@ def load_internal(export_dir, tags=None, loader_cls=Loader):
                           saved_model_proto,
                           export_dir)
       root = loader.get(0)
+      if isinstance(loader, Loader):
+        root.graph_debug_info = loader.adjust_debug_info_func_names(debug_info)
     root.tensorflow_version = meta_graph_def.meta_info_def.tensorflow_version
     root.tensorflow_git_version = (
         meta_graph_def.meta_info_def.tensorflow_git_version)
   else:
     with ops.init_scope():
       root = load_v1_in_v2.load(export_dir, tags)
+      root.graph_debug_info = debug_info
   return root

@@ -1,17 +1,18 @@
-package(default_visibility = [
-    "//visibility:public",
-])
-
 load("//tensorflow:tensorflow.bzl", "tf_cc_test")
 load("//tensorflow/lite:build_def.bzl", "gen_selected_ops", "tflite_copts")
 
-licenses(["notice"])  # Apache 2.0
+package(
+    default_visibility = [
+        "//visibility:public",
+    ],
+    licenses = ["notice"],  # Apache 2.0
+)
 
 exports_files(["LICENSE"])
 
 gen_selected_ops(
     name = "smartreply_ops",
-    model = "@tflite_smartreply//:smartreply.tflite",
+    model = ["@tflite_smartreply//:smartreply.tflite"],
 )
 
 cc_library(
@@ -28,6 +29,7 @@ cc_library(
         "//tensorflow/lite:string_util",
         "//tensorflow/lite/kernels:builtin_ops",
         "//tensorflow/lite/kernels:kernel_util",
+        "//tensorflow/lite/kernels/internal:tensor",
         "@com_google_absl//absl/strings",
         "@com_googlesource_code_re2//:re2",
         "@farmhash_archive//:farmhash",

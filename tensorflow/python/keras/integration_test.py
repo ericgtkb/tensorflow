@@ -28,6 +28,7 @@ from tensorflow.python.eager import context
 from tensorflow.python.framework import dtypes
 from tensorflow.python.keras import keras_parameterized
 from tensorflow.python.keras import testing_utils
+from tensorflow.python.keras.utils import np_utils
 from tensorflow.python.ops import nn_ops as nn
 from tensorflow.python.ops import rnn_cell
 from tensorflow.python.platform import test
@@ -40,7 +41,6 @@ class KerasIntegrationTest(keras_parameterized.TestCase):
     fpath = os.path.join(self.temp_dir,
                          'test_model_%s' % (random.randint(0, 1e7),))
     if context.executing_eagerly():
-      keras.saving.save._KERAS_SAVED_MODEL_STILL_EXPERIMENTAL = False
       save_format = 'tf'
     else:
       if (not isinstance(model, keras.Sequential) and
@@ -63,7 +63,7 @@ class VectorClassificationIntegrationTest(keras_parameterized.TestCase):
         test_samples=0,
         input_shape=(10,),
         num_classes=2)
-    y_train = keras.utils.to_categorical(y_train)
+    y_train = np_utils.to_categorical(y_train)
 
     model = testing_utils.get_model_from_layers(
         [keras.layers.Dense(16, activation='relu'),
@@ -74,7 +74,8 @@ class VectorClassificationIntegrationTest(keras_parameterized.TestCase):
         loss='categorical_crossentropy',
         optimizer=keras.optimizer_v2.adam.Adam(0.005),
         metrics=['acc'],
-        run_eagerly=testing_utils.should_run_eagerly())
+        run_eagerly=testing_utils.should_run_eagerly(),
+        experimental_run_tf_function=testing_utils.should_run_tf_function())
     history = model.fit(x_train, y_train, epochs=10, batch_size=10,
                         validation_data=(x_train, y_train),
                         verbose=2)
@@ -93,7 +94,7 @@ class VectorClassificationIntegrationTest(keras_parameterized.TestCase):
         test_samples=0,
         input_shape=(10,),
         num_classes=2)
-    y_train = keras.utils.to_categorical(y_train)
+    y_train = np_utils.to_categorical(y_train)
 
     base_model = testing_utils.get_model_from_layers(
         [keras.layers.Dense(16,
@@ -110,7 +111,8 @@ class VectorClassificationIntegrationTest(keras_parameterized.TestCase):
         loss='categorical_crossentropy',
         optimizer=keras.optimizer_v2.adam.Adam(0.005),
         metrics=['acc'],
-        run_eagerly=testing_utils.should_run_eagerly())
+        run_eagerly=testing_utils.should_run_eagerly(),
+        experimental_run_tf_function=testing_utils.should_run_tf_function())
     if not testing_utils.should_run_eagerly():
       self.assertEqual(len(model.get_losses_for(None)), 2)
       self.assertEqual(len(model.get_updates_for(x)), 2)
@@ -140,7 +142,7 @@ class SequentialIntegrationTest(KerasIntegrationTest):
         test_samples=0,
         input_shape=(10,),
         num_classes=2)
-    y_train = keras.utils.to_categorical(y_train)
+    y_train = np_utils.to_categorical(y_train)
     model = keras.Sequential([
         keras.layers.Dense(16, activation='relu'),
         keras.layers.Dropout(0.1),
@@ -150,18 +152,31 @@ class SequentialIntegrationTest(KerasIntegrationTest):
         loss='categorical_crossentropy',
         optimizer=keras.optimizer_v2.adam.Adam(0.005),
         metrics=['acc'],
-        run_eagerly=testing_utils.should_run_eagerly())
+        run_eagerly=testing_utils.should_run_eagerly(),
+        experimental_run_tf_function=testing_utils.should_run_tf_function())
     model.fit(x_train, y_train, epochs=1, batch_size=10,
               validation_data=(x_train, y_train),
               verbose=2)
     model = self._save_and_reload_model(model)
+
+    # TODO(b/134537740): model.pop doesn't update model outputs properly when
+    # model.outputs is already defined, so just set to `None` for now.
+    model.inputs = None
+    model.outputs = None
+
     model.pop()
     model.add(keras.layers.Dense(y_train.shape[-1], activation='softmax'))
+
+    # TODO(b/134523282): There is an bug with Sequential models, so the model
+    # must be marked as compiled=False to ensure the next compile goes through.
+    model._is_compiled = False
+
     model.compile(
         loss='categorical_crossentropy',
         optimizer=keras.optimizer_v2.adam.Adam(0.005),
         metrics=['acc'],
-        run_eagerly=testing_utils.should_run_eagerly())
+        run_eagerly=testing_utils.should_run_eagerly(),
+        experimental_run_tf_function=testing_utils.should_run_tf_function())
     history = model.fit(x_train, y_train, epochs=10, batch_size=10,
                         validation_data=(x_train, y_train),
                         verbose=2)
@@ -185,7 +200,7 @@ class TimeseriesClassificationIntegrationTest(keras_parameterized.TestCase):
         test_samples=0,
         input_shape=(4, 10),
         num_classes=2)
-    y_train = keras.utils.to_categorical(y_train)
+    y_train = np_utils.to_categorical(y_train)
 
     layers = [
         keras.layers.LSTM(5, return_sequences=True),
@@ -197,7 +212,8 @@ class TimeseriesClassificationIntegrationTest(keras_parameterized.TestCase):
         loss='categorical_crossentropy',
         optimizer=keras.optimizer_v2.adam.Adam(0.005),
         metrics=['acc'],
-        run_eagerly=testing_utils.should_run_eagerly())
+        run_eagerly=testing_utils.should_run_eagerly(),
+        experimental_run_tf_function=testing_utils.should_run_tf_function())
     history = model.fit(x_train, y_train, epochs=15, batch_size=10,
                         validation_data=(x_train, y_train),
                         verbose=2)
@@ -214,7 +230,7 @@ class TimeseriesClassificationIntegrationTest(keras_parameterized.TestCase):
         test_samples=0,
         input_shape=(4, 10),
         num_classes=2)
-    y_train = keras.utils.to_categorical(y_train)
+    y_train = np_utils.to_categorical(y_train)
 
     model = keras.models.Sequential()
     model.add(keras.layers.RNN(rnn_cell.LSTMCell(5), return_sequences=True,
@@ -226,7 +242,8 @@ class TimeseriesClassificationIntegrationTest(keras_parameterized.TestCase):
         loss='categorical_crossentropy',
         optimizer=keras.optimizer_v2.adam.Adam(0.005),
         metrics=['acc'],
-        run_eagerly=testing_utils.should_run_eagerly())
+        run_eagerly=testing_utils.should_run_eagerly(),
+        experimental_run_tf_function=testing_utils.should_run_tf_function())
     history = model.fit(x_train, y_train, epochs=15, batch_size=10,
                         validation_data=(x_train, y_train),
                         verbose=2)
@@ -248,7 +265,7 @@ class ImageClassificationIntegrationTest(keras_parameterized.TestCase):
         test_samples=0,
         input_shape=(10, 10, 3),
         num_classes=2)
-    y_train = keras.utils.to_categorical(y_train)
+    y_train = np_utils.to_categorical(y_train)
 
     layers = [
         keras.layers.Conv2D(4, 3, padding='same', activation='relu'),
@@ -264,7 +281,8 @@ class ImageClassificationIntegrationTest(keras_parameterized.TestCase):
         loss='categorical_crossentropy',
         optimizer=keras.optimizer_v2.adam.Adam(0.005),
         metrics=['acc'],
-        run_eagerly=testing_utils.should_run_eagerly())
+        run_eagerly=testing_utils.should_run_eagerly(),
+        experimental_run_tf_function=testing_utils.should_run_tf_function())
     history = model.fit(x_train, y_train, epochs=10, batch_size=10,
                         validation_data=(x_train, y_train),
                         verbose=2)
@@ -291,7 +309,7 @@ class ActivationV2IntegrationTest(keras_parameterized.TestCase):
         test_samples=0,
         input_shape=(10,),
         num_classes=2)
-    y_train = keras.utils.to_categorical(y_train)
+    y_train = np_utils.to_categorical(y_train)
 
     model = keras.Sequential([
         keras.layers.Flatten(input_shape=x_train.shape[1:]),
@@ -304,17 +322,19 @@ class ActivationV2IntegrationTest(keras_parameterized.TestCase):
     last_layer_activation = model.get_layer(index=2).get_config()['activation']
     self.assertEqual(last_layer_activation, 'softmax')
 
-    model.compile(loss='categorical_crossentropy',
-                  optimizer=keras.optimizer_v2.adam.Adam(0.005),
-                  metrics=['accuracy'],
-                  run_eagerly=testing_utils.should_run_eagerly())
+    model.compile(
+        loss='categorical_crossentropy',
+        optimizer=keras.optimizer_v2.adam.Adam(0.005),
+        metrics=['accuracy'],
+        run_eagerly=testing_utils.should_run_eagerly(),
+        experimental_run_tf_function=testing_utils.should_run_tf_function())
     model.fit(x_train, y_train, epochs=2, batch_size=10,
               validation_data=(x_train, y_train),
               verbose=2)
 
     output_path = os.path.join(self.get_temp_dir(), 'tf_keras_saved_model')
-    keras.saving.saved_model.export_saved_model(model, output_path)
-    loaded_model = keras.saving.saved_model.load_from_saved_model(output_path)
+    model.save(output_path, save_format='tf')
+    loaded_model = keras.models.load_model(output_path)
     self.assertEqual(model.summary(), loaded_model.summary())
 
 if __name__ == '__main__':

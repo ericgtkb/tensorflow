@@ -15,11 +15,12 @@ limitations under the License.
 #ifndef TENSORFLOW_LITE_TESTING_GENERATE_TESTSPEC_H_
 #define TENSORFLOW_LITE_TESTING_GENERATE_TESTSPEC_H_
 
+#include <algorithm>
 #include <functional>
 #include <iostream>
 #include <vector>
 
-#include "tensorflow/lite/string.h"
+#include "tensorflow/lite/string_type.h"
 
 namespace tflite {
 namespace testing {
@@ -46,19 +47,16 @@ bool GenerateTestSpecFromTensorflowModel(
     const std::vector<string>& output_layer);
 
 // Generates random values that are filled into the tensor.
-// random_func returns the generated random element at given index.
-template <typename T>
+template <typename T, typename RandomFunction>
 std::vector<T> GenerateRandomTensor(const std::vector<int>& shape,
-                                    const std::function<T(int)>& random_func) {
+                                    RandomFunction random_func) {
   int64_t num_elements = 1;
   for (const int dim : shape) {
     num_elements *= dim;
   }
 
   std::vector<T> result(num_elements);
-  for (int i = 0; i < num_elements; i++) {
-    result[i] = random_func(i);
-  }
+  std::generate_n(result.data(), num_elements, random_func);
   return result;
 }
 

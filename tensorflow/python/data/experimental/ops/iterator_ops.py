@@ -29,10 +29,16 @@ from tensorflow.python.util.tf_export import tf_export
 
 @tf_export("data.experimental.make_saveable_from_iterator")
 def make_saveable_from_iterator(iterator):
-  """Returns a SaveableObject for saving/restore iterator state using Saver.
+  """Returns a SaveableObject for saving/restoring iterator state using Saver.
 
   Args:
     iterator: Iterator.
+
+  Returns:
+    A SaveableObject for saving/restoring iterator state using Saver.
+
+  Raises:
+    ValueError: If iterator does not support checkpointing.
 
   For example:
 
@@ -175,7 +181,6 @@ class CheckpointInputPipelineHook(session_run_hook.SessionRunHook):
     # `checkpoint_dir` is the same as the model checkpoint directory, there are
     # no conflicts during restore.
     self._latest_filename = "checkpoint_" + checkpoint_prefix
-    self._first_run = True
 
   def begin(self):
     # Build a Saver that saves all iterators in the `GLOBAL_ITERATORS`
@@ -189,6 +194,11 @@ class CheckpointInputPipelineHook(session_run_hook.SessionRunHook):
                                                         self._latest_filename)
     # pylint: enable=protected-access
     self._checkpoint_saver_hook.begin()
+
+  def after_create_session(self, session, coord):
+    # If a new session was created, we set _first_run to True so that we can
+    # restore if needed.
+    self._first_run = True
 
   def _restore_or_save_initial_ckpt(self, session):
     # Ideally this should be run in after_create_session but is not for the
@@ -261,4 +271,3 @@ class _CustomSaver(saver_lib.Saver):
     return super(_CustomSaver, self).save(
         sess, save_path, global_step, latest_filename or self._latest_filename,
         meta_graph_suffix, write_meta_graph, write_state, strip_default_attrs)
-
